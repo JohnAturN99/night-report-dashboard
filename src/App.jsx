@@ -17,17 +17,31 @@ function idToCode(id) {
 
 // derive status tag by keywords with fixed priority
 function deriveStatusTag(entry) {
-  const text = `${entry.title} ${entry.notes.join(" ")}`.toLowerCase();
+  const title = entry.title.toLowerCase();
+  const notes = entry.notes.join(" ").toLowerCase();
 
-  const hasDefect = /\bdefect:/i.test(text) || /\bgr\b/.test(text);
-  const inPhase = /major serv|phase|365d/.test(text);
-  const recovery = /post phase rcv|recovery/.test(text);
+  // Rectification if defects/GR appear anywhere
+  const hasDefect =
+    /\bdefect:/.test(title) ||
+    /\bdefect:/.test(notes) ||
+    /\bgr\b/.test(title) ||
+    /\bgr\b/.test(notes);
+
+  // In-phase ONLY if the HEADER mentions Major Serv or Phase
+  const inPhase = /(major serv|phase\b)/.test(title);
+
+  // Recovery if noted in header or notes
+  const recovery =
+    /(post phase rcv|recovery)/.test(title) ||
+    /(post phase rcv|recovery)/.test(notes);
 
   // Priority: Red > Orange > Blue > Green
-  if (hasDefect) return "rectification"; // Red
-  if (inPhase) return "in-phase";        // Orange
-  if (recovery) return "recovery";       // Blue
-  if (/\s-\s*s(\b|$)/i.test(entry.title)) return "serviceable"; // Green
+  if (hasDefect) return "rectification";
+  if (inPhase) return "in-phase";
+  if (recovery) return "recovery";
+
+  // Explicit "- S" in header or default to serviceable
+  if (/\s-\s*s(\b|$)/i.test(entry.title)) return "serviceable";
   return "serviceable";
 }
 
