@@ -5,11 +5,15 @@ import {
   getAuth,
   GoogleAuthProvider,
   signInWithPopup,
+  signInWithRedirect,
+  getRedirectResult,
+  setPersistence,
+  browserLocalPersistence,
+  inMemoryPersistence,
   signOut,
   onAuthStateChanged,
 } from "firebase/auth";
 
-// Your Firebase config (from Firebase console → Project settings → Web app)
 const firebaseConfig = {
   apiKey: "AIzaSyDsiUaR4OzyzGD8nx_LP46XdMrLvIFFXKQ",
   authDomain: "night-report-dashboard.firebaseapp.com",
@@ -17,19 +21,42 @@ const firebaseConfig = {
   storageBucket: "night-report-dashboard.firebasestorage.app",
   messagingSenderId: "162631132761",
   appId: "1:162631132761:web:1a3d9fb24a291f5b8d7348",
-  measurementId: "G-JTC1Y7N8H4"
+  measurementId: "G-JTC1Y7N8H4",
 };
 
 const app = initializeApp(firebaseConfig);
-
-// Firestore (database)
 export const db = getFirestore(app);
 
-// Auth (Google Sign-In)
 export const auth = getAuth(app);
+// keep user signed in; fallback if browser blocks storage
+setPersistence(auth, browserLocalPersistence).catch(() =>
+  setPersistence(auth, inMemoryPersistence)
+);
+
 const provider = new GoogleAuthProvider();
 
-export function signInWithGoogle() {
-  return signInWithPopup(auth, provider);
+export async function signInWithGoogleSmart() {
+  try {
+    return await signInWithPopup(auth, provider);
+  } catch (e) {
+    if (
+      e?.code === "auth/operation-not-supported-in-this-environment" ||
+      e?.code === "auth/popup-blocked"
+    ) {
+      await signInWithRedirect(auth, provider);
+      return null;
+    }
+    throw e;
+  }
 }
-export { signOut, onAuthStateChanged };
+
+export async function completeRedirectSignIn() {
+  try {
+    return await getRedirectResult(auth); // null if no redirect happened
+  } catch (e) {
+    console.error("Redirect sign-in failed:", e);
+    return null;
+  }
+}
+
+export { onAuthStateChanged, signOut };
