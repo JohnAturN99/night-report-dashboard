@@ -5,7 +5,7 @@
 //   * "Follow latest" auto-loads the newest saved report date
 //   * History list shows past reports with who/when last saved
 // - Generator: compose a Night Report from HOTO quick inputs + pasted Telegram defects
-// - HOTO checker: paste HOTO, tick outstanding items, and save ticks with the report
+// - HOTO checker: paste HOTO, tick outstanding items, move to Completed, and save to Firestore
 //
 // Storage: Firestore (collection "reports", doc id = "YYYY-MM-DD")
 // Auth: Google (popup with redirect fallback handled in firebase.js)
@@ -341,7 +341,6 @@ function parseHOTO(text) {
    ========================= */
 export default function App() {
   // ========== Top-level UI state ==========
-  // Modal for clicking a card in Overview
   const [detail, setDetail] = useState(null); // { id, code, entry } | null
 
   // Complete redirect-based sign-in (e.g., Safari PWA)
@@ -377,14 +376,15 @@ export default function App() {
   const [hotoRaw, setHotoRaw] = useState("");
   const hoto = useMemo(() => parseHOTO(hotoRaw), [hotoRaw]);
   const [hotoTicks, setHotoTicks] = useState({}); // key `${code}|${text}` -> boolean
+  const [hotoDone, setHotoDone] = useState({}); // { code: [itemText, ...] } moved from Outstanding → Completed
+
   function toggleTick(code, text) {
     const key = `${code}|${text}`;
     setHotoTicks((prev) => ({ ...prev, [key]: !prev[key] }));
   }
 
   // ========== Firestore live data ==========
-  // History list (array of { id, updatedAt, savedBy, title })
-  const [cloudDates, setCloudDates] = useState([]);
+  const [cloudDates, setCloudDates] = useState([]); // history list
   const docUnsubRef = useRef(null); // per-doc listener cleanup
 
   // Listen to collection of reports; keep newest first; optionally auto-follow newest
@@ -408,7 +408,6 @@ export default function App() {
       if (docs.length) {
         const newestId = docs[0].id;
         const hasSelected = docs.some((x) => x.id === selectedDate);
-        // Follow newest automatically, or recover if selected date was deleted
         if (followLatest && selectedDate !== newestId) {
           loadCloudDate(newestId);
         } else if (!hasSelected) {
@@ -442,12 +441,14 @@ export default function App() {
           setRaw(data.raw || "");
           setHotoRaw(data.hotoRaw || "");
           setHotoTicks(data.hotoTicks || {});
+          setHotoDone(data.hotoDone || {});
         } else {
           // New/empty date
           setReportTitle("Night Report");
           setRaw("");
           setHotoRaw("");
           setHotoTicks({});
+          setHotoDone({});
         }
       },
       (err) => {
@@ -468,6 +469,7 @@ export default function App() {
         raw,
         hotoRaw,
         hotoTicks,
+        hotoDone, // persist moves
         updatedAt: serverTimestamp(),
         savedBy: user?.email || null,   // who saved
       });
@@ -573,6 +575,52 @@ export default function App() {
     );
   }
 
+  // Move ticked Outstanding items → Job Completed (local; persist on Save)
+  function moveTickedToCompleted() {
+    const updates = {}; // code -> Set(items)
+    let count = 0;
+
+    Object.keys(hoto.outstanding || {}).forEach((code) => {
+      const group = hoto.outstanding[code];
+      (group.items || []).forEach((item) => {
+        const key = `${code}|${item}`;
+        if (hotoTicks[key]) {
+          if (!updates[code]) updates[code] = new Set(hotoDone[code] || []);
+          if (!updates[code].has(item)) {
+            updates[code].add(item);
+            count++;
+          }
+        }
+      });
+    });
+
+    if (count === 0) {
+      alert("No ticked items to move.");
+      return;
+    }
+
+    if (!confirm(`Move ${count} ticked item(s) to Job Completed?`)) return;
+
+    // Apply to hotoDone
+    const nextDone = { ...hotoDone };
+    Object.keys(updates).forEach((code) => {
+      nextDone[code] = Array.from(updates[code]);
+    });
+    setHotoDone(nextDone);
+
+    // Clear ticks for moved items
+    const nextTicks = { ...hotoTicks };
+    Object.keys(updates).forEach((code) => {
+      updates[code].forEach((item) => {
+        const k = `${code}|${item}`;
+        delete nextTicks[k];
+      });
+    });
+    setHotoTicks(nextTicks);
+
+    alert("Moved. Click “Save to cloud” to persist.");
+  }
+
   // ========== Derived UI state for Overview ==========
   const parsed = useMemo(() => parseReport(raw), [raw]);
 
@@ -584,6 +632,27 @@ export default function App() {
       return { id, code, entry };
     });
   }, [parsed]);
+
+  // Merge HOTO "Job Completed" with items you moved via the Done button
+  const completedMerged = useMemo(() => {
+    const merged = {};
+    // Start with parsed Completed from HOTO text
+    Object.keys(hoto.completed || {}).forEach((code) => {
+      merged[code] = [...hoto.completed[code]];
+    });
+    // Add moved items (hotoDone)
+    Object.keys(hotoDone || {}).forEach((code) => {
+      if (!merged[code]) merged[code] = [];
+      hotoDone[code].forEach((item) => {
+        if (!merged[code].includes(item)) merged[code].push(item);
+      });
+    });
+    return merged;
+  }, [hoto.completed, hotoDone]);
+
+  function isMoved(code, item) {
+    return !!(hotoDone[code]?.includes(item));
+  }
 
   // Helper to show a short preview line (first defect line if available)
   function firstDefectLine(entry) {
@@ -760,9 +829,7 @@ export default function App() {
               const tag = entry?.tag || "none";
               const classes = entry ? statusToClasses(tag) : "bg-gray-50 border-gray-200";
 
-              // Short preview line for the card body
               const short = entry ? firstDefectLine(entry) : "";
-
               const clickable = !!entry;
 
               return (
@@ -1006,7 +1073,7 @@ export default function App() {
           <section className="mb-8">
             <h2 className="text-xl font-semibold mb-3">HOTO Checker</h2>
             <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
-              {/* Paste HOTO */}
+              {/* Paste HOTO (LEFT COLUMN) */}
               <div className="lg:col-span-1">
                 <label className="text-sm block mb-2">
                   <span className="block text-gray-700 mb-1">Paste HOTO text</span>
@@ -1018,23 +1085,24 @@ export default function App() {
                   />
                 </label>
                 <p className="text-xs text-gray-500">
-                  Ticks on Outstanding are saved with the “Save to cloud” button.
+                  Tick items under Outstanding, press <b>Done</b> to move them to Job Completed,
+                  then click <b>Save to cloud</b> to persist.
                 </p>
-              </div>
+              </div> {/* ← FIXED: close the left column before starting right side */}
 
-              {/* Completed + Outstanding with tickboxes */}
+              {/* Completed + Outstanding (RIGHT COLUMNS) */}
               <div className="lg:col-span-2 grid grid-cols-1 md:grid-cols-2 gap-4">
                 {/* Completed */}
                 <div className="border rounded-2xl p-4 bg-green-50 border-green-300">
                   <div className="font-semibold mb-2">🟩 Job Completed</div>
-                  {Object.keys(hoto.completed).length === 0 ? (
+                  {Object.keys(completedMerged).length === 0 ? (
                     <div className="text-sm text-gray-500">No completed items.</div>
                   ) : (
-                    Object.keys(hoto.completed).sort().map((code) => (
+                    Object.keys(completedMerged).sort().map((code) => (
                       <div key={code} className="mb-3">
                         <div className="font-medium">{code}</div>
                         <ul className="list-disc pl-5 text-sm space-y-1 mt-1">
-                          {hoto.completed[code].map((t, i) => (
+                          {completedMerged[code].map((t, i) => (
                             <li key={i}>{t.startsWith("> ") ? <span className="ml-2">{t.slice(2)}</span> : t}</li>
                           ))}
                         </ul>
@@ -1045,7 +1113,16 @@ export default function App() {
 
                 {/* Outstanding */}
                 <div className="border rounded-2xl p-4 bg-red-50 border-red-300">
-                  <div className="font-semibold mb-2">🟥 Outstanding</div>
+                  <div className="flex items-center justify-between mb-2">
+                    <div className="font-semibold">🟥 Outstanding</div>
+                    <button
+                      className="text-xs border rounded px-2 py-1 bg-blue-600 text-white"
+                      onClick={moveTickedToCompleted}
+                      title="Move ticked items to Job Completed (saved after you click Save to cloud)"
+                    >
+                      Done → Move ticked to Completed
+                    </button>
+                  </div>
                   {Object.keys(hoto.outstanding).length === 0 ? (
                     <div className="text-sm text-gray-500">No outstanding items.</div>
                   ) : (
@@ -1057,7 +1134,7 @@ export default function App() {
                             {code} {group.tag ? <span className="text-xs text-gray-600">({group.tag})</span> : null}
                           </div>
                           <div className="flex flex-col gap-1 mt-1">
-                            {group.items.map((t, i) => {
+                            {group.items.filter((t) => !isMoved(code, t)).map((t, i) => {
                               const key = `${code}|${t}`;
                               const done = !!hotoTicks[key];
                               return (
