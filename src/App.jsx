@@ -1,11 +1,10 @@
 // src/App.jsx
 // Night Report Dashboard (React + Vite + Tailwind)
-// - Overview: 8 fixed placeholders (252, 253, 260, 261, 262, 263, 265, 266)
-//   * Click a card to open a modal with full defect details
-//   * "Follow latest" auto-loads the newest saved report date
-//   * History list shows past reports with who/when last saved
-// - Generator: compose a Night Report from HOTO quick inputs + pasted Telegram defects
-// - HOTO checker: paste HOTO, tick outstanding items, move to Completed, and save to Firestore
+// Tabs:
+//  - Overview: shows latest Night Report as 8 tail cards (click for details)
+//  - RTS:      parse & display Daily RTS OR a Weekly RTS plan (missions before Healing)
+//  - Generator:compose Night Report from HOTO + Telegram defects
+//  - HOTO:     paste HOTO, tick outstanding items, move to Completed, and save
 //
 // Storage: Firestore (collection "reports", doc id = "YYYY-MM-DD")
 // Auth: Google (popup with redirect fallback handled in firebase.js)
@@ -337,6 +336,278 @@ function parseHOTO(text) {
 }
 
 /* =========================
+   RTS parsing (Daily + Weekly)
+   ========================= */
+
+// Parse a "13 Aug 25 (Wed) 🚁" header into {iso, label}
+function parseDateHeader(header) {
+  const months = {
+    jan: 0, january: 0,
+    feb: 1, february: 1,
+    mar: 2, march: 2,
+    apr: 3, april: 3,
+    may: 4,
+    jun: 5, june: 5,
+    jul: 6, july: 6,
+    aug: 7, august: 7,
+    sep: 8, sept: 8, september: 8,
+    oct: 9, october: 9,
+    nov: 10, november: 10,
+    dec: 11, december: 11,
+  };
+
+  const line = (header || "").replace(/[^\w\s()/-]/g, "").trim(); // strip emojis etc.
+  // Examples:
+  // "13 Aug 25 (Wed)"  or "13 Aug (Wed)"  or "13 Aug 2025 (Wed)" or "13 Aug 25"
+  const m = line.match(/^(\d{1,2})\s+([A-Za-z]{3,9})(?:\s+(\d{2,4}))?/);
+  if (!m) {
+    return { iso: null, label: header.trim() || "—" };
+  }
+  const dd = parseInt(m[1], 10);
+  const monName = m[2].toLowerCase();
+  const mmIndex = months[monName];
+  let yyyy;
+  if (m[3]) {
+    const yr = parseInt(m[3], 10);
+    yyyy = yr < 100 ? (2000 + yr) : yr;
+  } else {
+    // fallback: current year (okay for weekly without year)
+    yyyy = new Date().getFullYear();
+  }
+  const iso = (mmIndex != null)
+    ? `${yyyy}-${String(mmIndex + 1).padStart(2, "0")}-${String(dd).padStart(2, "0")}`
+    : null;
+
+  return { iso, label: line.replace(/\s+\d{4}$/, "").trim() || header.trim() };
+}
+
+// Split a weekly text into day blocks starting at lines like "11 Aug (Mon)"
+function splitWeekIntoDays(text) {
+  const lines = (text || "").replace(/\r/g, "").split("\n");
+  const idxs = [];
+  const dayRe = /^\s*\d{1,2}\s+[A-Za-z]{3,9}(?:\s+\d{2,4})?\s*(?:\([^)]+\))?/; // e.g., "11 Aug (Mon)"
+  for (let i = 0; i < lines.length; i++) {
+    if (dayRe.test(lines[i].trim())) idxs.push(i);
+  }
+  const blocks = [];
+  for (let k = 0; k < idxs.length; k++) {
+    const start = idxs[k];
+    const end = k + 1 < idxs.length ? idxs[k + 1] : lines.length;
+    const chunk = lines.slice(start, end).join("\n").trim();
+    if (chunk) blocks.push(chunk);
+  }
+  return blocks;
+}
+
+// Section collector: read lines until any of the "nextHeaders" token is seen
+function parseSection(lines, startIdx, nextHeaders) {
+  const out = [];
+  let i = startIdx;
+  const guard = new RegExp(`^\\s*(?:${nextHeaders.map(h => h.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|")})\\b`, "i");
+  for (; i < lines.length; i++) {
+    const s = lines[i].trim();
+    if (!s) { out.push(""); continue; }
+    if (guard.test(s)) break;
+    out.push(s);
+  }
+  // Trim trailing empty lines
+  while (out.length && !out[out.length - 1].trim()) out.pop();
+  return { items: out, nextIdx: i };
+}
+
+// Mission line parser
+function parseMissionLine(ln) {
+  const s = (ln || "").trim();
+  if (!s || /^nil$/i.test(s)) return null;
+
+  // Detect explicit spare lines, but avoid "Spare Window"
+  const isSpareText = /\bspare\b(?!\s*window)/i.test(s);
+
+  // Standard mission like "F3 1130 - 2200 GH/IF/ASUW/ASW/DIP"
+  const mStd = s.match(/^([FS]\d)\s*[:\-]?\s*(\d{3,4}\s*-\s*\d{3,4})?\s*(.*)$/i);
+  if (mStd) {
+    const code = mStd[1].toUpperCase();
+    const time = (mStd[2] || "").replace(/\s+/g, "");
+    const rest = (mStd[3] || "").trim();
+    if (isSpareText || /^spare\b/i.test(rest)) {
+      return { type: "spare", code, label: `${code} Spare${rest.replace(/^spare/i, "") ? " " + rest.replace(/^spare/i, "").trim() : ""}`.trim() };
+    }
+    // e.g., "F3 1000-1200 Ferry", "S6 1400-1600 Ferry Spare Window" (keep as mission)
+    const text = [time, rest].filter(Boolean).join(" ");
+    return { type: "mission", code, label: text || code };
+  }
+
+  // Lines like "S3 TR as Spare by 1530"
+  const mAsSpare = s.match(/^([FS]\d).*?\bspare\b/i);
+  if (mAsSpare && !/\bspare\s*window\b/i.test(s)) {
+    const code = mAsSpare[1].toUpperCase();
+    return { type: "spare", code, label: s };
+  }
+
+  // "Nil Spare"
+  if (/^nil\s*spare/i.test(s)) {
+    return { type: "spare", code: null, label: "Nil Spare" };
+  }
+
+  // "BMD", "RSD", etc. → treat as miscellaneous mission text (no code)
+  if (/^(BMD|RSD)\b/i.test(s)) {
+    return { type: "mission", code: null, label: s };
+  }
+
+  return null; // not a mission/spare
+}
+
+// Healing line parser → may contain multiple time ranges on one line
+function parseHealingLine(ln) {
+  const s = (ln || "").trim();
+  if (!s || /^nil$/i.test(s)) return [];
+  // Accept with or without colon: "S2: 1200 - 1300 1500 - 1600 GR" OR "S2 1300 - 1400 FCF"
+  const m = s.match(/^([FS]\d)\s*:?\s*(.+)$/i);
+  if (!m) return [{ code: null, label: s }];
+
+  const code = m[1].toUpperCase();
+  const rhs = m[2].trim();
+
+  // Split by time ranges, keep text
+  // Extract times like "1200 - 1300" or "1200-1300"
+  const times = [];
+  const timeRe = /(\d{3,4}\s*-\s*\d{3,4})/g;
+  let lastIndex = 0;
+  let match;
+  while ((match = timeRe.exec(rhs)) !== null) {
+    const chunk = match[1].replace(/\s+/g, "");
+    times.push(chunk);
+    lastIndex = timeRe.lastIndex;
+  }
+  // If no time found, keep whole RHS
+  if (times.length === 0) {
+    return [{ code, label: rhs }];
+  }
+  // Include trailing text (like "GR" or "FCF") once at the end if present
+  const trailing = rhs.slice(lastIndex).trim();
+  const items = times.map((t) => ({ code, label: trailing ? `${t} ${trailing}` : t }));
+  return items;
+}
+
+// Parse a single daily RTS message
+function parseRTSDaily(text) {
+  const lines = (text || "").replace(/\r/g, "").split("\n");
+  if (!lines.length) return null;
+
+  const { iso, label } = parseDateHeader(lines[0] || "");
+
+  const H_RTS = /^rts\s*:/i;
+  const H_HEAL = /^healing\b/i;
+  const H_HOT = /^hot\b/i;
+  const H_COLD = /^cold\b/i;
+  const H_OPS = /^ops\s*brief\b/i;
+  const H_NOTES = /^notes\b/i; // allow "Notes" or "Notes:"
+
+  const isHeader = (s) =>
+    H_RTS.test(s) || H_HEAL.test(s) || H_HOT.test(s) || H_COLD.test(s) || H_OPS.test(s) || H_NOTES.test(s);
+
+  let i = 1; // start scanning after header line
+  const missions = [];
+  const spares = [];
+  const healing = [];
+  const hot = [];
+  const cold = [];
+  const ops = [];
+  const notes = [];
+
+  // 1) Capture any mission/spare lines BEFORE the first header (common in your daily format)
+  let j = i;
+  while (j < lines.length && !isHeader(lines[j].trim())) j++;
+  if (j > i) {
+    lines.slice(i, j).map((s) => s.trim()).filter(Boolean).forEach((ln) => {
+      const m = parseMissionLine(ln);
+      if (!m) return;
+      if (m.type === "spare") spares.push(m);
+      else missions.push(m);
+    });
+    i = j;
+  }
+
+  // 2) Process explicit sections
+  while (i < lines.length) {
+    const s = lines[i].trim();
+
+    if (H_RTS.test(s)) {
+      const { items, nextIdx } = parseSection(lines, i + 1, ["Healing", "Hot", "Cold", "Ops Brief", "Notes"]);
+      items.forEach((ln) => {
+        const m = parseMissionLine(ln);
+        if (!m) return;
+        if (m.type === "spare") spares.push(m);
+        else missions.push(m);
+      });
+      i = nextIdx;
+      continue;
+    }
+
+    if (H_HEAL.test(s)) {
+      const { items, nextIdx } = parseSection(lines, i + 1, ["Hot", "Cold", "Ops Brief", "Notes"]);
+      items.forEach((ln) => healing.push(...parseHealingLine(ln)));
+      i = nextIdx;
+      continue;
+    }
+
+    if (H_HOT.test(s)) {
+      const { items, nextIdx } = parseSection(lines, i + 1, ["Cold", "Ops Brief", "Notes"]);
+      items.forEach((ln) => { if (/\S/.test(ln) && !/^nil$/i.test(ln)) hot.push(ln); });
+      i = nextIdx;
+      continue;
+    }
+
+    if (H_COLD.test(s)) {
+      const { items, nextIdx } = parseSection(lines, i + 1, ["Ops Brief", "Notes"]);
+      items.forEach((ln) => { if (/\S/.test(ln) && !/^nil$/i.test(ln)) cold.push(ln); });
+      i = nextIdx;
+      continue;
+    }
+
+    if (H_OPS.test(s)) {
+      const { items, nextIdx } = parseSection(lines, i + 1, ["Notes"]);
+      items.forEach((ln) => { if (/\S/.test(ln)) ops.push(ln.replace(/[,;]/g, ",").trim()); });
+      i = nextIdx;
+      continue;
+    }
+
+    if (H_NOTES.test(s)) {
+      const { items, nextIdx } = parseSection(lines, i + 1, []);
+      items.forEach((ln) => { if (/\S/.test(ln)) notes.push(ln); });
+      i = nextIdx;
+      continue;
+    }
+
+    i++;
+  }
+
+  return { dateISO: iso, dateLabel: label, missions, spares, healing, hot, cold, ops, notes };
+}
+
+// Parse a weekly RTS plan (missions are below each date, before Healing)
+function parseRTSWeek(text) {
+  const blocks = splitWeekIntoDays(text);
+  if (!blocks.length) return [];
+
+  return blocks.map((chunk) => {
+    const lines = chunk.split("\n");
+    const header = lines[0] || "";
+    const { iso, label } = parseDateHeader(header);
+
+    // Body may not include explicit headers; treat pre-header (before "Healing/Notes/Hot/Cold/Ops") as RTS
+    let body = lines.slice(1).join("\n");
+    const hasAnyHeader = /(RTS:|Healing|Notes|Hot|Cold|Ops Brief)/i.test(body);
+    if (!hasAnyHeader) {
+      body = `RTS:\n${body}`;
+    }
+
+    const parsed = parseRTSDaily(`${label}\n${body}`);
+    return parsed || { dateISO: iso, dateLabel: label, missions: [], spares: [], healing: [], hot: [], cold: [], ops: [], notes: [] };
+  });
+}
+
+/* =========================
    App
    ========================= */
 export default function App() {
@@ -355,7 +626,7 @@ export default function App() {
     return () => unsub();
   }, []);
 
-  // Tabs: 'overview' | 'generator' | 'hoto'
+  // Tabs: 'overview' | 'rts' | 'generator' | 'hoto'
   const [tab, setTab] = useState("overview");
 
   // Date + report editor text
@@ -382,6 +653,13 @@ export default function App() {
     const key = `${code}|${text}`;
     setHotoTicks((prev) => ({ ...prev, [key]: !prev[key] }));
   }
+
+  // RTS inputs/state
+  const [rtsDailyRaw, setRtsDailyRaw] = useState("");
+  const rtsDaily = useMemo(() => (rtsDailyRaw ? parseRTSDaily(rtsDailyRaw) : null), [rtsDailyRaw]);
+
+  const [rtsWeekRaw, setRtsWeekRaw] = useState("");
+  const rtsWeek = useMemo(() => (rtsWeekRaw ? parseRTSWeek(rtsWeekRaw) : []), [rtsWeekRaw]);
 
   // ========== Firestore live data ==========
   const [cloudDates, setCloudDates] = useState([]); // history list
@@ -664,6 +942,11 @@ export default function App() {
     return entry.title.split(" - ").slice(1).join(" - "); // fallback: header tail
   }
 
+  // Chip helpers (RTS colors)
+  const chipMission = "inline-block text-xs px-2 py-1 rounded border bg-amber-100 border-amber-300 text-amber-900";
+  const chipSpare   = "inline-block text-xs px-2 py-1 rounded border bg-gray-100 border-gray-300 text-gray-700";
+  const chipHealing = "inline-block text-xs px-2 py-1 rounded border bg-blue-100 border-blue-300 text-blue-900";
+
   // ========== Render ==========
   return (
     <div className="min-h-screen p-4 md:p-8 max-w-7xl mx-auto">
@@ -692,11 +975,12 @@ export default function App() {
         </div>
       </div>
 
-      {/* Tabs (Overview / Generator / HOTO) */}
+      {/* Tabs (Overview / RTS / Generator / HOTO) */}
       <nav className="mb-6 border-b">
         <ul className="flex gap-2">
           {[
             ["overview", "Overview"],
+            ["rts", "RTS"],
             ["generator", "Night report generator"],
             ["hoto", "HOTO checker"],
           ].map(([key, label]) => (
@@ -979,6 +1263,238 @@ export default function App() {
         </>
       )}
 
+      {tab === "rts" && (
+        <>
+          {/* RTS: Daily */}
+          <section className="mb-8">
+            <h2 className="text-xl font-semibold mb-3">RTS — Daily</h2>
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+              <div>
+                <label className="text-sm block mb-2">
+                  <span className="block text-gray-700 mb-1">Paste DAILY RTS</span>
+                  <textarea
+                    className="w-full min-h-[260px] border rounded p-3"
+                    value={rtsDailyRaw}
+                    onChange={(e) => setRtsDailyRaw(e.target.value)}
+                    placeholder={`13 Aug 25 (Wed) 🚁\n\nF3 1130 - 2200 GH/IF/ASUW/ASW/DIP\nS3 Spare\n\nHealing 🏥 \nS2 1300 - 1400 FCF\n\nHot ⛽️ \nF3 1415, 1715, 1845\n\nCold ⛽️\n2230\n\nOps Brief 🫱🫲:\n0900 & 1300\n\nNotes:\nS2: Profile A, Profile C, 1/rev, 4/rev\n...`}
+                  />
+                </label>
+              </div>
+              <div className="border rounded-2xl p-4">
+                {rtsDaily ? (
+                  <>
+                    <div className="flex items-center justify-between">
+                      <div className="font-semibold">{rtsDaily.dateLabel}</div>
+                      {rtsDaily.dateISO && (
+                        <button
+                          className="text-xs underline text-blue-700"
+                          onClick={() => {
+                            setFollowLatest(false);
+                            loadCloudDate(rtsDaily.dateISO);
+                            setTab("overview");
+                          }}
+                        >
+                          Load this date’s Night Report
+                        </button>
+                      )}
+                    </div>
+
+                    {/* Missions */}
+                    {rtsDaily.missions.length ? (
+                      <div className="mt-3">
+                        <div className="text-sm font-medium mb-1">Missions</div>
+                        <div className="flex flex-wrap gap-2">
+                          {rtsDaily.missions.map((m, i) => (
+                            <span key={i} className={chipMission}>
+                              {m.code ? `${m.code} — ${m.label}` : m.label}
+                            </span>
+                          ))}
+                        </div>
+                      </div>
+                    ) : null}
+
+                    {/* Spares */}
+                    {rtsDaily.spares.length ? (
+                      <div className="mt-3">
+                        <div className="text-sm font-medium mb-1">Spare</div>
+                        <div className="flex flex-wrap gap-2">
+                          {rtsDaily.spares.map((m, i) => (
+                            <span key={i} className={chipSpare}>
+                              {m.code ? `${m.code} — ${m.label}` : m.label}
+                            </span>
+                          ))}
+                        </div>
+                      </div>
+                    ) : null}
+
+                    {/* Healing */}
+                    {rtsDaily.healing.length ? (
+                      <div className="mt-3">
+                        <div className="text-sm font-medium mb-1">Healing</div>
+                        <div className="flex flex-wrap gap-2">
+                          {rtsDaily.healing.map((h, i) => (
+                            <span key={i} className={chipHealing}>
+                              {h.code ? `${h.code} — ${h.label}` : h.label}
+                            </span>
+                          ))}
+                        </div>
+                      </div>
+                    ) : null}
+
+                    {/* Hot/Cold/Ops/Notes as plain text */}
+                    {rtsDaily.hot.length ? (
+                      <div className="mt-3">
+                        <div className="text-sm font-medium mb-1">Hot ⛽️</div>
+                        <div className="text-sm whitespace-pre-wrap">{rtsDaily.hot.join("\n")}</div>
+                      </div>
+                    ) : null}
+                    {rtsDaily.cold.length ? (
+                      <div className="mt-3">
+                        <div className="text-sm font-medium mb-1">Cold ⛽️</div>
+                        <div className="text-sm whitespace-pre-wrap">{rtsDaily.cold.join("\n")}</div>
+                      </div>
+                    ) : null}
+                    {rtsDaily.ops.length ? (
+                      <div className="mt-3">
+                        <div className="text-sm font-medium mb-1">Ops Brief</div>
+                        <div className="text-sm whitespace-pre-wrap">{rtsDaily.ops.join("\n")}</div>
+                      </div>
+                    ) : null}
+                    {rtsDaily.notes.length ? (
+                      <div className="mt-3">
+                        <div className="text-sm font-medium mb-1">Notes</div>
+                        <ul className="list-disc pl-5 text-sm space-y-1">
+                          {rtsDaily.notes.map((n, i) => <li key={i}>{n}</li>)}
+                        </ul>
+                      </div>
+                    ) : null}
+                  </>
+                ) : (
+                  <div className="text-sm text-gray-500">Paste a DAILY RTS on the left.</div>
+                )}
+              </div>
+            </div>
+          </section>
+
+          {/* RTS: Weekly */}
+          <section className="mb-6">
+            <h2 className="text-xl font-semibold mb-2">RTS — Weekly Plan</h2>
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+              <div>
+                <label className="text-sm block mb-2">
+                  <span className="block text-gray-700 mb-1">Paste WEEKLY RTS plan</span>
+                  <textarea
+                    className="w-full min-h-[320px] border rounded p-3"
+                    value={rtsWeekRaw}
+                    onChange={(e) => setRtsWeekRaw(e.target.value)}
+                    placeholder={`11 Aug - 15 Aug RTS\n---------------------------------\n\n11 Aug (Mon)\n\nS3 1100-1830 GH/ASUW/ASW\nS6 1230-1830 VIP/ASUW/ASW (ERC)\nS5 Spare (ERC)\n\nHealing:\nNil\n\nNotes:\nS2 Profile A, Profile C, 1/Rev, 4/Rev\n...`}
+                  />
+                </label>
+                <p className="text-xs text-gray-500">
+                  Weekly format: missions listed directly under each date, then Healing/Notes etc.
+                </p>
+              </div>
+
+              <div className="grid grid-cols-1 gap-4">
+                {rtsWeek.length === 0 ? (
+                  <div className="text-sm text-gray-500 border rounded p-4">Paste a WEEKLY plan to preview.</div>
+                ) : (
+                  rtsWeek.map((day, idx) => (
+                    <div key={idx} className="border rounded-2xl p-4">
+                      <div className="flex items-center justify-between">
+                        <div className="font-semibold">{day.dateLabel}</div>
+                        {day.dateISO && (
+                          <button
+                            className="text-xs underline text-blue-700"
+                            onClick={() => {
+                              setFollowLatest(false);
+                              loadCloudDate(day.dateISO);
+                              setTab("overview");
+                            }}
+                          >
+                            Load this date’s Night Report
+                          </button>
+                        )}
+                      </div>
+
+                      {/* Missions */}
+                      {day.missions.length ? (
+                        <div className="mt-3">
+                          <div className="text-sm font-medium mb-1">Missions</div>
+                          <div className="flex flex-wrap gap-2">
+                            {day.missions.map((m, i) => (
+                              <span key={i} className={chipMission}>
+                                {m.code ? `${m.code} — ${m.label}` : m.label}
+                              </span>
+                            ))}
+                          </div>
+                        </div>
+                      ) : null}
+
+                      {/* Spare */}
+                      {day.spares.length ? (
+                        <div className="mt-3">
+                          <div className="text-sm font-medium mb-1">Spare</div>
+                          <div className="flex flex-wrap gap-2">
+                            {day.spares.map((m, i) => (
+                              <span key={i} className={chipSpare}>
+                                {m.code ? `${m.code} — ${m.label}` : m.label}
+                              </span>
+                            ))}
+                          </div>
+                        </div>
+                      ) : null}
+
+                      {/* Healing */}
+                      {day.healing.length ? (
+                        <div className="mt-3">
+                          <div className="text-sm font-medium mb-1">Healing</div>
+                          <div className="flex flex-wrap gap-2">
+                            {day.healing.map((h, i) => (
+                              <span key={i} className={chipHealing}>
+                                {h.code ? `${h.code} — ${h.label}` : h.label}
+                              </span>
+                            ))}
+                          </div>
+                        </div>
+                      ) : null}
+
+                      {/* Hot/Cold/Ops/Notes as plain text */}
+                      {day.hot.length ? (
+                        <div className="mt-3">
+                          <div className="text-sm font-medium mb-1">Hot ⛽️</div>
+                          <div className="text-sm whitespace-pre-wrap">{day.hot.join("\n")}</div>
+                        </div>
+                      ) : null}
+                      {day.cold.length ? (
+                        <div className="mt-3">
+                          <div className="text-sm font-medium mb-1">Cold ⛽️</div>
+                          <div className="text-sm whitespace-pre-wrap">{day.cold.join("\n")}</div>
+                        </div>
+                      ) : null}
+                      {day.ops.length ? (
+                        <div className="mt-3">
+                          <div className="text-sm font-medium mb-1">Ops Brief</div>
+                          <div className="text-sm whitespace-pre-wrap">{day.ops.join("\n")}</div>
+                        </div>
+                      ) : null}
+                      {day.notes.length ? (
+                        <div className="mt-3">
+                          <div className="text-sm font-medium mb-1">Notes</div>
+                          <ul className="list-disc pl-5 text-sm space-y-1">
+                            {day.notes.map((n, i) => <li key={i}>{n}</li>)}
+                          </ul>
+                        </div>
+                      ) : null}
+                    </div>
+                  ))
+                )}
+              </div>
+            </div>
+          </section>
+        </>
+      )}
+
       {tab === "generator" && (
         <>
           {/* Night Report Generator */}
@@ -1088,7 +1604,7 @@ export default function App() {
                   Tick items under Outstanding, press <b>Done</b> to move them to Job Completed,
                   then click <b>Save to cloud</b> to persist.
                 </p>
-              </div> {/* ← FIXED: close the left column before starting right side */}
+              </div>
 
               {/* Completed + Outstanding (RIGHT COLUMNS) */}
               <div className="lg:col-span-2 grid grid-cols-1 md:grid-cols-2 gap-4">
