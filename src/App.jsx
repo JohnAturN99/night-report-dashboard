@@ -1,7 +1,7 @@
 import React, { useEffect, useMemo, useState } from "react";
 
 /* =========================
-   App settings / constants
+   Settings / constants
    ========================= */
 const PLACEHOLDERS = [252, 253, 260, 261, 262, 263, 265, 266];
 const STORAGE_KEY = "nr_reports_v1"; // localStorage key
@@ -10,7 +10,7 @@ const STORAGE_KEY = "nr_reports_v1"; // localStorage key
    Helpers
    ========================= */
 function idToCode(id) {
-  if (id >= 252 && id <= 259) return `F${id - 250}`; // 252->F1, 252->F2, ...
+  if (id >= 251 && id <= 259) return `F${id - 250}`; // 252->F2, 253->F3
   if (id >= 260 && id <= 269) return `S${id - 260}`; // 260->S0, 261->S1, ...
   return String(id);
 }
@@ -111,7 +111,6 @@ export default function App() {
   useEffect(() => {
     const data = loadAllReports();
     setReports(data);
-    // If there are saved dates, pick the latest by date
     const dates = Object.keys(data).sort();
     if (dates.length) {
       const latest = dates[dates.length - 1];
@@ -119,7 +118,6 @@ export default function App() {
       setReportTitle(data[latest]?.title || "Night Report");
       setRaw(data[latest]?.raw || "");
     } else {
-      // default example text to help first-time users
       setRaw(DEFAULT_SAMPLE);
       setReportTitle("Night Report");
     }
@@ -166,21 +164,18 @@ export default function App() {
       setReportTitle(rec.title || "Night Report");
       setRaw(rec.raw || "");
     } else {
-      // No record → clear for fresh entry
       setReportTitle("Night Report");
       setRaw("");
     }
   }
 
   function handleDeleteDate(date) {
-    if (!date) return;
-    if (!reports[date]) return;
+    if (!date || !reports[date]) return;
     if (!confirm(`Delete saved report for ${date}?`)) return;
     const next = { ...reports };
     delete next[date];
     setReports(next);
     saveAllReports(next);
-    // Move to next available date or reset
     const remain = Object.keys(next).sort();
     if (remain.length) {
       const latest = remain[remain.length - 1];
@@ -219,7 +214,6 @@ export default function App() {
         const merged = { ...reports, ...imported };
         setReports(merged);
         saveAllReports(merged);
-        // Jump to latest
         const dates = Object.keys(merged).sort();
         if (dates.length) {
           const latest = dates[dates.length - 1];
@@ -227,7 +221,7 @@ export default function App() {
           setReportTitle(merged[latest]?.title || "Night Report");
           setRaw(merged[latest]?.raw || "");
         }
-        e.target.value = ""; // reset input
+        e.target.value = "";
       } catch {
         alert("Failed to read JSON file.");
       }
@@ -242,7 +236,7 @@ export default function App() {
         <div className="space-y-2">
           <h1 className="text-2xl md:text-3xl font-semibold">Night Report Dashboard</h1>
           <p className="text-sm text-gray-600">
-            8 placeholders: 252, 253, 260, 261, 262, 263, 265, 266. Mapping: F → 25x, S → 26x (e.g., F2→252, S1→261).
+            8 placeholders: 252, 253, 260, 261, 262, 263, 265, 266. Mapping: F → 25x, S → 26x (e.g., F2→252, F3→253, S1→261).
           </p>
         </div>
 
@@ -272,17 +266,10 @@ export default function App() {
             <button className="border rounded px-3 py-2 text-sm bg-blue-600 text-white" onClick={handleSave}>
               Save report to this date
             </button>
-            <button
-              className="border rounded px-3 py-2 text-sm"
-              onClick={() => handleLoadDate(selectedDate)}
-              title="Reload from saved"
-            >
+            <button className="border rounded px-3 py-2 text-sm" onClick={() => handleLoadDate(selectedDate)}>
               Load saved for this date
             </button>
-            <button
-              className="border rounded px-3 py-2 text-sm text-red-700"
-              onClick={() => handleDeleteDate(selectedDate)}
-            >
+            <button className="border rounded px-3 py-2 text-sm text-red-700" onClick={() => handleDeleteDate(selectedDate)}>
               Delete this date
             </button>
           </div>
@@ -314,18 +301,10 @@ export default function App() {
               {savedDates.map((d) => (
                 <li key={d} className={`p-2 text-sm ${d === selectedDate ? "bg-gray-50" : ""}`}>
                   <div className="flex items-center justify-between gap-2">
-                    <button
-                      className="underline text-blue-700"
-                      onClick={() => handleLoadDate(d)}
-                      title="Load this date"
-                    >
+                    <button className="underline text-blue-700" onClick={() => handleLoadDate(d)}>
                       {d} — {reports[d]?.title || "Night Report"}
                     </button>
-                    <button
-                      className="text-red-700"
-                      onClick={() => handleDeleteDate(d)}
-                      title="Delete this date"
-                    >
+                    <button className="text-red-700" onClick={() => handleDeleteDate(d)}>
                       Delete
                     </button>
                   </div>
