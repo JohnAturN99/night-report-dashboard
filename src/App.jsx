@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
-import { db } from "./firebase";
+import { db, auth, onAuthStateChanged, signInWithGoogle, signOut } from "./firebase";
 import {
   collection,
   doc,
@@ -25,8 +25,7 @@ function idToCode(id) {
   return String(id);
 }
 
-// derive status tag by keywords with fixed priority
-// IMPORTANT: "In Phase" only if HEADER mentions Major Serv/Phase (ignore '365D' in notes)
+// In-phase is based on HEADER only (ignore "365D" appearing in notes)
 function deriveStatusTag(entry) {
   const title = entry.title.toLowerCase();
   const notes = entry.notes.join(" ").toLowerCase();
@@ -142,6 +141,13 @@ function getTodayISO() {
    App
    ========================= */
 export default function App() {
+  // Auth state
+  const [user, setUser] = useState(null);
+  useEffect(() => {
+    const unsub = onAuthStateChanged(auth, (u) => setUser(u));
+    return () => unsub();
+  }, []);
+
   // UI state
   const [selectedDate, setSelectedDate] = useState(getTodayISO()); // yyyy-mm-dd
   const [reportTitle, setReportTitle] = useState("Night Report");
@@ -199,26 +205,39 @@ export default function App() {
     });
   }
 
-  // Save to Firestore (all users see this instantly)
+  // Save to Firestore (only allowed for whitelisted Google emails per rules)
   async function handleSave() {
-    if (!selectedDate) {
-      alert("Please pick a date.");
+    if (!user) {
+      alert("Please sign in with Google to save.");
       return;
     }
-    await setDoc(doc(db, "reports", selectedDate), {
-      title: reportTitle || "Night Report",
-      raw,
-      updatedAt: serverTimestamp(),
-    });
-    alert(`Saved cloud report for ${selectedDate}.`);
+    try {
+      await setDoc(doc(db, "reports", selectedDate), {
+        title: reportTitle || "Night Report",
+        raw,
+        updatedAt: serverTimestamp(),
+      });
+      alert(`Saved cloud report for ${selectedDate}.`);
+    } catch (e) {
+      alert("Save failed (check Firestore rules/whitelist).");
+      console.error(e);
+    }
   }
 
   // Delete a report date from Firestore
   async function handleDeleteDate(date) {
+    if (!user) {
+      alert("Please sign in with Google to delete.");
+      return;
+    }
     if (!date) return;
     if (!confirm(`Delete cloud report for ${date}?`)) return;
-    await deleteDoc(doc(db, "reports", date));
-    // Listener to the list will update cloudDates and switch selection as needed
+    try {
+      await deleteDoc(doc(db, "reports", date));
+    } catch (e) {
+      alert("Delete failed (check Firestore rules/whitelist).");
+      console.error(e);
+    }
   }
 
   // Parse the current raw text
@@ -235,16 +254,33 @@ export default function App() {
 
   return (
     <div className="min-h-screen p-4 md:p-8 max-w-7xl mx-auto">
-      {/* Top controls */}
-      <header className="flex flex-col gap-3 md:flex-row md:items-end md:justify-between mb-6">
-        <div className="space-y-2">
+      {/* Top bar: title + auth */}
+      <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-3 mb-4">
+        <div>
           <h1 className="text-2xl md:text-3xl font-semibold">Night Report Dashboard</h1>
           <p className="text-sm text-gray-600">
             8 placeholders: 252, 253, 260, 261, 262, 263, 265, 266. Mapping: F → 25x, S → 26x
             (e.g., F2→252, F3→253, S1→261).
           </p>
         </div>
+        <div className="flex items-center gap-2">
+          {user ? (
+            <>
+              <span className="text-sm text-gray-600">Signed in as {user.email}</span>
+              <button className="border rounded px-3 py-2 text-sm" onClick={() => signOut(auth)}>
+                Sign out
+              </button>
+            </>
+          ) : (
+            <button className="border rounded px-3 py-2 text-sm" onClick={signInWithGoogle}>
+              Sign in with Google to edit
+            </button>
+          )}
+        </div>
+      </div>
 
+      {/* Controls */}
+      <header className="flex flex-col gap-3 md:flex-row md:items-end md:justify-between mb-6">
         <div className="grid grid-cols-1 md:grid-cols-2 gap-2 md:gap-3">
           <label className="text-sm">
             <span className="block text-gray-700 mb-1">Report date</span>
@@ -269,8 +305,11 @@ export default function App() {
 
           <div className="flex gap-2 col-span-1 md:col-span-2">
             <button
-              className="border rounded px-3 py-2 text-sm bg-blue-600 text-white"
+              className={`border rounded px-3 py-2 text-sm text-white ${
+                user ? "bg-blue-600" : "bg-gray-400 cursor-not-allowed"
+              }`}
               onClick={handleSave}
+              disabled={!user}
             >
               Save report to this date (cloud)
             </button>
@@ -312,8 +351,11 @@ export default function App() {
                       {d}
                     </button>
                     <button
-                      className="text-red-700"
+                      className={`${
+                        user ? "text-red-700" : "text-gray-400 cursor-not-allowed"
+                      }`}
                       onClick={() => handleDeleteDate(d)}
+                      disabled={!user}
                       title="Delete this date"
                     >
                       Delete
